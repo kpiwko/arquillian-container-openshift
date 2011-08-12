@@ -17,8 +17,16 @@
 package org.jboss.arquillian.container.openshift.express;
 
 import java.io.ByteArrayInputStream;
+import java.io.IOException;
 import java.io.InputStream;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.net.URLConnection;
 import java.nio.charset.Charset;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -27,12 +35,15 @@ import org.jboss.arquillian.container.spi.client.container.DeployableContainer;
 import org.jboss.arquillian.container.spi.client.container.DeploymentException;
 import org.jboss.arquillian.container.spi.client.container.LifecycleException;
 import org.jboss.arquillian.container.spi.client.protocol.ProtocolDescription;
+import org.jboss.arquillian.container.spi.client.protocol.metadata.HTTPContext;
 import org.jboss.arquillian.container.spi.client.protocol.metadata.ProtocolMetaData;
+import org.jboss.arquillian.container.spi.client.protocol.metadata.Servlet;
 import org.jboss.arquillian.container.spi.context.annotation.ContainerScoped;
 import org.jboss.arquillian.core.api.Instance;
 import org.jboss.arquillian.core.api.InstanceProducer;
 import org.jboss.arquillian.core.api.annotation.Inject;
 import org.jboss.arquillian.core.spi.ServiceLoader;
+import org.jboss.arquillian.protocol.servlet.ServletMethodExecutor;
 import org.jboss.shrinkwrap.api.Archive;
 import org.jboss.shrinkwrap.api.exporter.ZipExporter;
 import org.jboss.shrinkwrap.descriptor.api.Descriptor;
@@ -147,13 +158,17 @@ public class OpenShiftExpressContainer implements DeployableContainer<OpenShiftE
         InputStream is = archive.as(ZipExporter.class).exportAsInputStream();
         repo.addAndPush(archive.getName(), is);
 
+        OpenShiftExpressConfiguration conf = configuration.get();
+        ProtocolMetaDataParser parser = new ProtocolMetaDataParser(conf);
+        ProtocolMetaData metaData = parser.parse(archive);
+
+        waitUntilDeployed(metaData);
+
         if (log.isLoggable(Level.FINE)) {
             log.fine("Deployment of " + archive.getName() + " took " + (System.currentTimeMillis() - beforeDeploy) + "ms");
         }
 
-        OpenShiftExpressConfiguration conf = configuration.get();
-        ProtocolMetaDataParser parser = new ProtocolMetaDataParser(conf);
-        return parser.parse(archive);
+        return metaData;
     }
 
     @Override
@@ -169,6 +184,52 @@ public class OpenShiftExpressContainer implements DeployableContainer<OpenShiftE
         }
     }
 
+    private void waitUntilDeployed(ProtocolMetaData metadata) throws DeploymentException {
+        HTTPContext context = metadata.getContext(HTTPContext.class);
+        if (context != null) {
+            List<Servlet> servlets = new ArrayList<Servlet>(context.getServlets());
+            Map<UrlChecker, Boolean> checkers = new ConcurrentHashMap<UrlChecker, Boolean>(servlets.size());
+
+            long timeout = System.currentTimeMillis() + 30000;
+            // there might be multiple servlets with name default
+            for (Servlet servlet : servlets) {
+                if ("default".equals(servlet.getName())) {
+                    StringBuilder url = new StringBuilder(servlet.getBaseURI().toASCIIString());
+
+                    UrlChecker checker = new UrlChecker(timeout, url.toString(), checkers);
+                    checkers.put(checker, false);
+                    new Thread(checker).start();
+                }
+            }
+
+            while (timeout > System.currentTimeMillis()) {
+                boolean results = true;
+                for (Boolean value : checkers.values()) {
+                    results &= value;
+                }
+
+                if (results == true) {
+                    return;
+                }
+
+                try {
+                    Thread.sleep(500);
+                } catch (InterruptedException e) {
+                    // ignore
+                }
+            }
+
+            StringBuilder sb = new StringBuilder();
+            for (Map.Entry<UrlChecker, Boolean> entry : checkers.entrySet()) {
+                sb.append(entry.getKey().getUrl()).append("\n");
+            }
+
+            throw new DeploymentException("Following path were not reachable within " + 30000 + " ms after git push. "
+                    + "Check if following archives are constructed properly:\n" + sb.toString());
+        }
+
+    }
+
     /**
      * Returns a credentials provider for OpenShift Express. If no implementation is found, it returns a configuration based
      * one.
@@ -180,4 +241,120 @@ public class OpenShiftExpressContainer implements DeployableContainer<OpenShiftE
         ServiceLoader service = serviceLoader.get();
         return service.onlyOne(CredentialsProvider.class);
     }
+}
+
+// in an interval, it checks whether an url returns HTTP 20x response
+class UrlChecker implements Runnable {
+    private static final Logger log = Logger.getLogger(UrlChecker.class.getName());
+
+    final long timeout;
+    final String url;
+    final Map<UrlChecker, Boolean> results;
+
+    UrlChecker(long timeout, String url, Map<UrlChecker, Boolean> results) {
+        this.timeout = timeout;
+        this.url = url;
+        this.results = results;
+    }
+
+    @Override
+    public void run() {
+        results.put(this, checkUrlWithRetry(url + ServletMethodExecutor.ARQUILLIAN_SERVLET_NAME + "?cmd=alive"));
+    }
+
+    private boolean checkUrlWithRetry(String url) {
+        boolean interrupted = false;
+        while (timeout > System.currentTimeMillis()) {
+            if (isUrlPresent(url) == true) {
+                return true;
+            }
+            try {
+                Thread.sleep(500);
+            } catch (InterruptedException e) {
+                interrupted = true;
+            }
+        }
+        if (interrupted) {
+            Thread.currentThread().interrupt();
+        }
+
+        return false;
+    }
+
+    private boolean isUrlPresent(String url) {
+
+        HttpURLConnection httpConnection = null;
+
+        try {
+            URLConnection connection = new URL(url).openConnection();
+            if (!(connection instanceof HttpURLConnection)) {
+                throw new IllegalStateException("Not an http connection! " + connection);
+            }
+
+            httpConnection = (HttpURLConnection) connection;
+            httpConnection.setUseCaches(false);
+            httpConnection.setDefaultUseCaches(false);
+            httpConnection.setDoInput(true);
+            httpConnection.setRequestMethod("GET");
+            httpConnection.setDoOutput(false);
+
+            httpConnection.connect();
+            httpConnection.getResponseCode();
+
+            log.info("Response :" + httpConnection.getResponseCode());
+
+            if (httpConnection.getResponseCode() == HttpURLConnection.HTTP_OK) {
+                return true;
+            }
+
+            return false;
+        } catch (IOException e) {
+            log.warning(e.getMessage());
+            return false;
+        } finally {
+            if (httpConnection != null) {
+                httpConnection.disconnect();
+            }
+        }
+    }
+
+    public String getUrl() {
+        return url;
+    }
+
+    /*
+     * (non-Javadoc)
+     *
+     * @see java.lang.Object#hashCode()
+     */
+    @Override
+    public int hashCode() {
+        final int prime = 31;
+        int result = 1;
+        result = prime * result + ((url == null) ? 0 : url.hashCode());
+        return result;
+    }
+
+    /*
+     * (non-Javadoc)
+     *
+     * @see java.lang.Object#equals(java.lang.Object)
+     */
+    @Override
+    public boolean equals(Object obj) {
+        if (this == obj)
+            return true;
+        if (obj == null)
+            return false;
+        if (getClass() != obj.getClass())
+            return false;
+        UrlChecker other = (UrlChecker) obj;
+        if (url == null) {
+            if (other.url != null)
+                return false;
+        } else if (!url.equals(other.url))
+            return false;
+        return true;
+    }
+
 }

@@ -8,12 +8,12 @@
 
     <container qualifier="openshift" default="true">
         <configuration>
-            <property name="namespace">kpiwko1</property>
-            <property name="application">arqtest</property>
-            <property name="libraDomain">dev.rhcloud.com</property>
-            <property name="sshUserName">8513ff2b2b2d4a1db88544a4f87931e1</property>
+            <property name="namespace">arqtest</property>
+            <property name="application">skipapp</property>
+            <property name="libraDomain">rhcloud.com</property>
+            <property name="sshUserName">52936e87e48342fe81b65b4a0157b5fa</property>
             <property name="passphrase">arqtest</property>
-            <property name="login">kpiwko1@redhat.com</property>
+            <property name="login">kpiwko@redhat.com</property>
         </configuration>
     </container>
 </arquillian>
